@@ -138,11 +138,18 @@ def _oss_call_json(
     reasoning_effort: str = "medium",
     extra_payload: Optional[Dict[str, Any]] = None,
 ) -> BaseModel:
+    """
+    Call the OSS chat endpoint using streaming mode, but buffer the full
+    structured output content before parsing it into `response_model`.
+
+    The OSS API streams OpenAI-style chat completion chunks where each line
+    is a JSON object with `choices[0].delta.content` fragments.
+    """
     payload: Dict[str, Any] = {
         "messages": messages,
         "model": _oss_model(),
         "reasoning_effort": reasoning_effort,
-        "stream": False,
+        "stream": True,
         "response_format": {
             "type": "json_schema",
             "json_schema": _build_json_schema_from_pydantic(response_model),
@@ -151,7 +158,9 @@ def _oss_call_json(
     if extra_payload:
         payload.update(extra_payload)
 
-    logger.debug("Calling OSS with structured output: %s", response_model.__name__)
+    logger.debug(
+        "Calling OSS with structured output (streaming) for %s", response_model.__name__
+    )
     try:
         resp = requests.post(
             _oss_base_url(),
@@ -159,34 +168,78 @@ def _oss_call_json(
             headers=_oss_headers(),
             timeout=_oss_timeout(),
             verify=False,
+            stream=True,
         )
     except Exception as exc:  # pragma: no cover - network failure
         logger.exception("OSS call failed: %s", exc)
         raise HTTPException(status_code=502, detail="Upstream model call failed.") from exc
 
     if resp.status_code != 200:
-        logger.error("OSS returned non-200: %s %s", resp.status_code, resp.text)
+        try:
+            from json import dumps as _dumps
+
+            payload_str = _dumps(payload, indent=2, default=str)
+        except Exception:  # pragma: no cover - logging best-effort
+            payload_str = "<unserializable payload>"
+        logger.error(
+            "OSS returned non-200: %s %s\nPayload: %s",
+            resp.status_code,
+            resp.text,
+            payload_str,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Upstream model error: {resp.status_code}",
         )
 
+    # Stream and accumulate delta.content fragments into a single string.
+    content_buffer = ""
     try:
-        data = resp.json()
-    except Exception as exc:  # pragma: no cover - malformed JSON
-        logger.exception("OSS returned invalid JSON: %s", exc)
-        raise HTTPException(status_code=502, detail="Invalid JSON from model.") from exc
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                decoded = line.decode("utf-8").strip()
+            except Exception:
+                continue
+            if not decoded:
+                continue
+            # Support both raw JSON lines and SSE-style "data: {...}" lines
+            if decoded.startswith("data:"):
+                decoded = decoded[5:].strip()
+            if decoded == "[DONE]":
+                break
+            try:
+                chunk = json.loads(decoded)
+            except Exception:
+                # Not a valid JSON chunk; skip
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            piece = delta.get("content")
+            if isinstance(piece, str):
+                content_buffer += piece
+    finally:
+        resp.close()
 
-    content = data.get("choices", [{}])[0].get("message", {}).get("content")
-    if isinstance(content, str):
-        try:
-            content = json.loads(content)
-        except json.JSONDecodeError as exc:
-            logger.exception("Failed to parse content as JSON: %s", exc)
-            raise HTTPException(
-                status_code=502,
-                detail="Model did not return valid structured JSON.",
-            ) from exc
+    if not content_buffer:
+        logger.error("OSS streaming returned no content for %s", response_model.__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="Model did not return any streamed content.",
+        )
+
+    # For structured output, the model is expected to stream a JSON string.
+    try:
+        content = json.loads(content_buffer)
+    except json.JSONDecodeError as exc:
+        logger.exception("Failed to parse streamed content as JSON: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail="Model did not return valid structured JSON.",
+        ) from exc
 
     try:
         return response_model.model_validate(content)
@@ -222,7 +275,18 @@ def _oss_stream_text(
         logger.exception("OSS streaming call failed: %s", exc)
         raise HTTPException(status_code=502, detail="Upstream model streaming failed.") from exc
     if resp.status_code != 200:
-        logger.error("OSS streaming returned non-200: %s %s", resp.status_code, resp.text)
+        try:
+            from json import dumps as _dumps
+
+            payload_str = _dumps(payload, indent=2, default=str)
+        except Exception:  # pragma: no cover
+            payload_str = "<unserializable payload>"
+        logger.error(
+            "OSS streaming returned non-200: %s %s\nPayload: %s",
+            resp.status_code,
+            resp.text,
+            payload_str,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Upstream model streaming error: {resp.status_code}",
