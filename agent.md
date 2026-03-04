@@ -69,7 +69,7 @@ class PlannerOutput(BaseModel):
 
 
 class AgentStatusUpdate(BaseModel):
-    todo_id: str
+    id: str
     status: str
 
 
@@ -742,14 +742,26 @@ async def _planner_phase(
     user_message: str,
 ) -> PlannerOutput:
     session = _get_session(session_id)
+    # Make the planner explicitly aware of available tools so it can
+    # propose tool-aware todos (e.g., which Mongo tools to call).
+    tools_description = json.dumps(
+        AVAILABLE_TOOLS,
+        indent=2,
+        default=str,
+    )
     system_prompt = (
-        "You are a planner agent. Given the latest user request and context, "
-        "produce a structured PlannerOutput JSON object. "
-        "You MUST:\n"
+        "You are a planner agent that coordinates work for an execution agent which has access to tools.\n\n"
+        "GOALS:\n"
+        "- Given the latest user request and context, produce a structured PlannerOutput JSON object.\n"
         "- First, think step by step and write a clear natural-language 'reasoning' string explaining your plan.\n"
         "- Then, create a list of TODOS, where each todo has id, title, optional description, and "
         "status in {pending,in_progress,done}.\n"
-        "Return ONLY valid JSON matching the PlannerOutput schema."
+        "- Todos SHOULD explicitly reference which tool(s) they expect the execution agent to use where relevant.\n\n"
+        "TOOLS AVAILABLE TO THE EXECUTION AGENT (for your planning only):\n"
+        f"{tools_description}\n\n"
+        "IMPORTANT:\n"
+        "- You are only PLANNING; you MUST NOT invent tool results.\n"
+        "- Return ONLY valid JSON matching the PlannerOutput schema. Do not include prose outside JSON."
     )
 
     messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -826,7 +838,7 @@ async def _agent_loop(
         if step_output.status_updates:
             for upd in step_output.status_updates:
                 for t in todos:
-                    if t.get("id") == upd.todo_id:
+                    if t.get("id") == upd.id:
                         t["status"] = upd.status
 
         if step_output.new_todos:
