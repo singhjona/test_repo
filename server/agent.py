@@ -138,7 +138,7 @@ def _oss_call_json(
     reasoning_effort: str = "medium",
     extra_payload: Optional[Dict[str, Any]] = None,
 ) -> BaseModel:
-    inner: Dict[str, Any] = {
+    payload: Dict[str, Any] = {
         "messages": messages,
         "model": _oss_model(),
         "reasoning_effort": reasoning_effort,
@@ -149,10 +149,7 @@ def _oss_call_json(
         },
     }
     if extra_payload:
-        inner.update(extra_payload)
-
-    # Some gateways expect the chat payload wrapped under 'input'
-    payload: Dict[str, Any] = {"input": inner}
+        payload.update(extra_payload)
 
     logger.debug("Calling OSS with structured output: %s", response_model.__name__)
     try:
@@ -205,13 +202,12 @@ def _oss_stream_text(
     messages: List[Dict[str, Any]],
     reasoning_effort: str = "medium",
 ) -> requests.Response:
-    inner: Dict[str, Any] = {
+    payload: Dict[str, Any] = {
         "messages": messages,
         "model": _oss_model(),
         "reasoning_effort": reasoning_effort,
         "stream": True,
     }
-    payload: Dict[str, Any] = {"input": inner}
     logger.debug("Calling OSS with streaming response.")
     try:
         resp = requests.post(
