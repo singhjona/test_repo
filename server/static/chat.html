@@ -1044,6 +1044,13 @@
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
 
+            // Debug: show that chunks are arriving from the server as soon as they are sent.
+            console.debug(
+              "[SSE] chunk received from /agent/chat/stream:",
+              value ? value.length : 0,
+              "bytes"
+            );
+
             let boundary = buffer.indexOf("\n\n");
             while (boundary !== -1) {
               const chunk = buffer.slice(0, boundary);
@@ -1087,6 +1094,8 @@
       }
 
       function handleEvent(type, data) {
+        // Debug: log every event the frontend processes so we can correlate with server logs.
+        console.debug("[SSE] event received:", type, data);
         switch (type) {
           case "start":
             setStatus("Agent is working...");

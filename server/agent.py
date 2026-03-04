@@ -1014,6 +1014,14 @@ async def _agent_session_stream(request: ChatRequest) -> AsyncGenerator[bytes, N
         _append_message(session, "user", request.message)
 
     async def send_event(event_type: str, data: Dict[str, Any]) -> None:
+        # Debug logging so we can correlate server-side event emission with
+        # what the frontend sees (or does not see) over SSE.
+        try:
+            preview = json.dumps(data, default=str)
+        except Exception:
+            preview = "<unserializable>"
+        logger.debug("SSE enqueue -> event=%s data=%s", event_type, preview[:512])
+
         payload = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
         await queue.put(payload.encode("utf-8"))
 
@@ -1067,6 +1075,8 @@ async def _agent_session_stream(request: ChatRequest) -> AsyncGenerator[bytes, N
         chunk = await queue.get()
         if not chunk:
             break
+        # Debug logging for what is actually being streamed to the client.
+        logger.debug("SSE send -> bytes=%d chunk_preview=%r", len(chunk), chunk[:120])
         yield chunk
 
 
