@@ -51,7 +51,10 @@ class PlannerTodo(BaseModel):
     description: str | None = None
     status: str = Field(
         ...,
-        description="Todo status: pending, in_progress, or done.",
+        description=(
+            "Todo status: one of pending, in_progress, completed, or failed. "
+            "Older plans may still use 'done' for completed work."
+        ),
     )
 
 
@@ -91,8 +94,24 @@ class SummarizerOutput(BaseModel):
     needs_more_planning: bool = Field(
         ...,
         description=(
-            "Set to true if more work/todos are still needed and the workflow should return to the planner; "
-            "false if the task is fully complete and this summary can be shown as final."
+            "Kept for backward compatibility. In the current workflow this should always be false, "
+            "because the verifier/decider stage determines whether more planning is needed."
+        ),
+    )
+
+
+class VerifierOutput(BaseModel):
+    task_complete: bool = Field(
+        ...,
+        description=(
+            "True if, in your judgment, the user's overall request has been fully satisfied and "
+            "no further planning or execution is required. False if more work is still needed."
+        ),
+    )
+    reason: str = Field(
+        ...,
+        description=(
+            "Short natural-language explanation of why the task is complete or what is still missing."
         ),
     )
 
@@ -749,6 +768,113 @@ def _build_available_tools() -> List[Dict[str, Any]]:
 AVAILABLE_TOOLS: List[Dict[str, Any]] = _build_available_tools()
 
 
+def _normalize_status(status: str | None) -> str:
+    """
+    Normalize todo status strings into a small set of canonical values.
+
+    Canonical statuses used by the task manager:
+    - 'pending'
+    - 'in_progress'
+    - 'completed'
+    - 'failed'
+    - 'removed' (legacy support)
+    - 'done' (legacy alias for 'completed')
+    """
+    if not status:
+        return "pending"
+    s = str(status).strip().lower()
+    if s in {"in progress", "in_progress"}:
+        return "in_progress"
+    if s in {"completed", "complete"}:
+        return "completed"
+    if s in {"done"}:
+        return "done"
+    if s in {"failed", "error"}:
+        return "failed"
+    if s in {"removed"}:
+        return "removed"
+    return s
+
+
+def _is_terminal_status(status: str | None) -> bool:
+    s = _normalize_status(status)
+    return s in {"completed", "done", "failed", "removed"}
+
+
+class TaskManager:
+    """
+    Simple non-LLM task manager that owns the lifecycle of TODOS for a session.
+
+    It enforces the invariant that the execution agent works on one active todo
+    at a time and treats 'completed' and 'failed' (plus legacy 'done') as
+    terminal statuses.
+    """
+
+    def __init__(self, session: Dict[str, Any]) -> None:
+        self._session = session
+
+    @property
+    def todos(self) -> List[Dict[str, Any]]:
+        return self._session.setdefault("todos", [])
+
+    def get_next_active_todo(self) -> Dict[str, Any] | None:
+        """
+        Return the next todo that is not in a terminal status, preferring
+        'in_progress' items first and then 'pending' ones.
+        """
+        in_progress: List[Dict[str, Any]] = []
+        pending: List[Dict[str, Any]] = []
+        for t in self.todos:
+            status = _normalize_status(t.get("status"))
+            if _is_terminal_status(status):
+                continue
+            if status == "in_progress":
+                in_progress.append(t)
+            else:
+                pending.append(t)
+        if in_progress:
+            return in_progress[0]
+        if pending:
+            return pending[0]
+        return None
+
+    def all_tasks_terminal(self) -> bool:
+        return self.get_next_active_todo() is None
+
+    def reset_with_planner_output(self, planner_output: PlannerOutput) -> None:
+        """
+        Replace the underlying todo list with the planner's fresh todos.
+        """
+        self._session["todos"] = [todo.model_dump() for todo in planner_output.todos]
+
+    def apply_agent_step(self, step_output: AgentStepOutput) -> None:
+        """
+        Apply an AgentStepOutput's updates to the underlying todo list in a
+        deterministic, non-LLM way.
+        """
+        todos = list(self.todos)
+
+        if step_output.status_updates:
+            for upd in step_output.status_updates:
+                for t in todos:
+                    if t.get("id") == upd.id:
+                        t["status"] = upd.status
+
+        if step_output.new_todos:
+            todos.extend(
+                [
+                    nt.model_dump()
+                    for nt in step_output.new_todos
+                ]
+            )
+
+        if step_output.removed_todo_ids:
+            remove_ids = set(step_output.removed_todo_ids)
+            todos = [t for t in todos if t.get("id") not in remove_ids]
+
+        self._session["todos"] = todos
+
+
 def _get_session(session_id: str) -> Dict[str, Any]:
     if session_id not in _SESSION_STATE:
         _SESSION_STATE[session_id] = {
@@ -786,7 +912,8 @@ async def _planner_phase(
         "- Given the latest user request and context, produce a structured PlannerOutput JSON object.\n"
         "- First, think step by step and write a clear natural-language 'reasoning' string explaining your plan.\n"
         "- Then, create a list of TODOS, where each todo has id, title, optional description, and "
-        "status in {pending,in_progress,done}.\n"
+        "status in {pending, in_progress, completed, failed}.\n"
+        "- New todos you create should normally start in the 'pending' status.\n"
         "- Todos SHOULD explicitly reference which tool(s) they expect the execution agent to use where relevant.\n\n"
         "TOOLS AVAILABLE TO THE EXECUTION AGENT (for your planning only):\n"
         f"{tools_description}\n\n"
@@ -846,19 +973,25 @@ async def _agent_loop(
     max_iterations: int = 32,
 ) -> None:
     session = _get_session(session_id)
+    task_manager = TaskManager(session)
 
     for iteration in range(max_iterations):
-        todos: List[Dict[str, Any]] = session.get("todos", [])
-        pending = [t for t in todos if t.get("status") != "done"]
-        if not pending:
+        current = task_manager.get_next_active_todo()
+        if current is None:
             break
 
-        current = pending[0]
+        todos: List[Dict[str, Any]] = task_manager.todos
         system_prompt = (
-            "You are an execution agent. You have access to TOOLS and must choose at most one tool per step. "
+            "You are an execution agent. You receive ONE current todo at a time from a separate "
+            "non-LLM task manager, and you may also see the full list of todos with their statuses.\n\n"
+            "You have access to TOOLS and must choose at most one tool per step. "
             "Return JSON matching AgentStepOutput: selected_tool (or null), tool_input (or null), "
             "step_explanation, optional new_todos, status_updates, and optional removed_todo_ids "
-            "for todos that are no longer needed because requirements changed. "
+            "for todos that are no longer needed because requirements changed.\n\n"
+            "Todo status semantics:\n"
+            "- 'pending' and 'in_progress' mean work is still required.\n"
+            "- 'completed' (or legacy 'done') means the todo has been successfully finished.\n"
+            "- 'failed' means the todo was attempted but could not be completed successfully.\n\n"
             "TOOLS metadata is provided in the system message; only use listed tools.\n\n"
             "CRITICAL:\n"
             "- You MUST return ONLY valid JSON matching the AgentStepOutput schema.\n"
@@ -905,20 +1038,8 @@ async def _agent_loop(
             },
         )
 
-        if step_output.status_updates:
-            for upd in step_output.status_updates:
-                for t in todos:
-                    if t.get("id") == upd.id:
-                        t["status"] = upd.status
-
-        if step_output.new_todos:
-            todos.extend([nt.model_dump() for nt in step_output.new_todos])
-
-        if step_output.removed_todo_ids:
-            remove_ids = set(step_output.removed_todo_ids)
-            todos = [t for t in todos if t.get("id") not in remove_ids]
-
-        session["todos"] = todos
+        task_manager.apply_agent_step(step_output)
+        todos = task_manager.todos
 
         await send_event(
             "agent_step",
@@ -960,13 +1081,15 @@ async def _summarizer_phase(
 ) -> SummarizerOutput:
     session = _get_session(session_id)
     system_prompt = (
-        "You are a summarizer/controller. Look at the full history of messages, TODOS, and tool calls. "
-        "Decide whether the user's request is fully satisfied or if more planning/work is needed.\n\n"
+        "You are a summarizer. A separate verifier/decider stage has already determined that the "
+        "user's request is complete enough to summarize.\n\n"
+        "Your job is to look at the full history of messages, TODOS (with their final statuses), "
+        "and tool calls, and produce a concise, user-facing summary of what was done.\n\n"
         "Return ONLY a SummarizerOutput JSON object:\n"
         "- summary: concise natural-language summary of what has been done so far.\n"
         "- details: optional extra detail.\n"
-        "- needs_more_planning: true if more work/todos are needed and the workflow should go back to the planner; "
-        "false if the task is complete and the summary can be shown as final.\n\n"
+        "- needs_more_planning: ALWAYS set this to false in the current workflow, because the verifier "
+        "has already decided that no further planning is required.\n\n"
         "CRITICAL:\n"
         "- You MUST return ONLY valid JSON matching the SummarizerOutput schema.\n"
         "- Do not include any explanation outside the JSON.\n"
@@ -1052,6 +1175,64 @@ async def _stream_model_reasoning(
         resp.close()
 
 
+async def _verifier_phase(
+    session_id: str,
+    user_message: str,
+    send_event,
+) -> VerifierOutput:
+    """
+    Verifier/decider that inspects the full conversation, todos, and tool calls
+    and decides whether the overall user task is complete.
+    """
+    session = _get_session(session_id)
+    system_prompt = (
+        "You are a verifier/decider that controls whether the workflow should stop or "
+        "return to the planner.\n\n"
+        "You must look at the full history of messages, TODOS (with their statuses), "
+        "and tool calls, and decide whether the user's overall request has been fully "
+        "satisfied.\n\n"
+        "Todo status semantics:\n"
+        "- 'pending' and 'in_progress' mean there is still work remaining.\n"
+        "- 'completed' (or legacy 'done') means the todo was successfully finished.\n"
+        "- 'failed' means the todo was attempted but could not be completed successfully.\n\n"
+        "Return ONLY a VerifierOutput JSON object:\n"
+        "- task_complete: true if no further planning/execution is needed, false otherwise.\n"
+        "- reason: short explanation of your decision.\n\n"
+        "CRITICAL:\n"
+        "- You MUST return ONLY valid JSON matching the VerifierOutput schema.\n"
+        "- Do not include any explanation outside the JSON.\n"
+        "- If you output anything that is not valid JSON for this schema, you have FAILED the task."
+    )
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    messages.extend(session["messages"])
+    # Provide the current todos and high-level request explicitly.
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"Decide if the overall task is complete for the request: {user_message}\n"
+                f"Current TODOS with statuses: {json.dumps(session.get('todos', []))}"
+            ),
+        }
+    )
+
+    loop = asyncio.get_running_loop()
+    await send_event(
+        "phase",
+        {"phase": "verifier", "status": "started"},
+    )
+    verdict = await loop.run_in_executor(
+        None,
+        lambda: _oss_call_json(messages, VerifierOutput),
+    )
+    await send_event(
+        "phase",
+        {"phase": "verifier", "status": "completed"},
+    )
+    await send_event("verifier", verdict.model_dump())
+    return verdict
+
+
 async def _agent_session_stream(request: ChatRequest) -> AsyncGenerator[bytes, None]:
     session_id = request.session_id
     lock = _get_session_lock(session_id)
@@ -1079,6 +1260,8 @@ async def _agent_session_stream(request: ChatRequest) -> AsyncGenerator[bytes, N
             await send_event("start", {"session_id": session_id})
             await _stream_model_reasoning(session_id, request.message, send_event)
             max_cycles = 4
+            task_complete = False
+            last_verifier_reason: str | None = None
             for cycle in range(max_cycles):
                 planner_output = await _planner_phase(session_id, request.message, send_event)
                 await send_event(
@@ -1097,10 +1280,25 @@ async def _agent_session_stream(request: ChatRequest) -> AsyncGenerator[bytes, N
                     },
                 )
                 await _agent_loop(session_id, send_event)
-                summary = await _summarizer_phase(session_id, request.message, send_event)
-                if not summary.needs_more_planning:
+                verifier_output = await _verifier_phase(
+                    session_id,
+                    request.message,
+                    send_event,
+                )
+                last_verifier_reason = verifier_output.reason
+                if verifier_output.task_complete:
+                    task_complete = True
                     break
-            await send_event("end", {"session_id": session_id})
+            if task_complete:
+                await _summarizer_phase(session_id, request.message, send_event)
+            await send_event(
+                "end",
+                {
+                    "session_id": session_id,
+                    "task_complete": task_complete,
+                    "verifier_reason": last_verifier_reason,
+                },
+            )
         except HTTPException as exc:
             await send_event(
                 "error",

@@ -271,7 +271,7 @@
         border: 1px dashed rgba(107, 126, 211, 0.7);
         background: radial-gradient(circle at top, rgba(70, 194, 255, 0.18), rgba(7, 10, 34, 0.9));
         color: var(--text);
-        font-size: 12px;
+        font-size: 11px;
       }
 
       .msg-meta {
@@ -283,6 +283,28 @@
 
       .markdown {
         font-size: 13px;
+      }
+
+      .msg-reasoning .markdown {
+        font-size: 11px;
+        max-height: 140px;
+        overflow-y: auto;
+        overflow-x: auto;
+        display: block;
+      }
+
+      .markdown table {
+        width: 100%;
+        border-collapse: collapse;
+        display: block;
+        overflow-x: auto;
+      }
+
+      .markdown th,
+      .markdown td {
+        padding: 3px 6px;
+        font-size: 11px;
+        border-bottom: 1px solid rgba(62, 77, 155, 0.6);
       }
 
       .markdown h1,
@@ -422,10 +444,17 @@
         border: 1px solid rgba(70, 194, 255, 0.9);
       }
 
-      .todo-status-done {
+      .todo-status-done,
+      .todo-status-completed {
         background: rgba(84, 233, 181, 0.15);
         color: #d6ffe9;
         border: 1px solid rgba(84, 233, 181, 0.9);
+      }
+
+      .todo-status-failed {
+        background: rgba(255, 79, 109, 0.16);
+        color: #ffd6de;
+        border: 1px solid rgba(255, 79, 109, 0.9);
       }
 
       .todo-status-removed {
@@ -854,16 +883,27 @@
           header.appendChild(title);
 
           const statusBadge = document.createElement("div");
-          const statusKey =
-            todo.status === "in_progress" || todo.status === "in progress"
-              ? "in_progress"
-              : todo.status;
+          const rawStatus = (todo.status || "").toString().toLowerCase();
+          let statusKey;
+          if (rawStatus === "in progress" || rawStatus === "in_progress") {
+            statusKey = "in_progress";
+          } else if (rawStatus === "completed" || rawStatus === "complete" || rawStatus === "done") {
+            statusKey = "completed";
+          } else if (rawStatus === "failed" || rawStatus === "error") {
+            statusKey = "failed";
+          } else if (rawStatus === "removed") {
+            statusKey = "removed";
+          } else {
+            statusKey = "pending";
+          }
           statusBadge.className = `todo-status-badge todo-status-${statusKey}`;
           statusBadge.textContent =
             statusKey === "in_progress"
               ? "IN PROGRESS"
-              : statusKey === "done"
-              ? "DONE"
+              : statusKey === "completed"
+              ? "COMPLETED"
+              : statusKey === "failed"
+              ? "FAILED"
               : statusKey === "removed"
               ? "REMOVED"
               : "PENDING";
@@ -1188,6 +1228,23 @@
                 meta: data.needs_more_planning
                   ? "Interim summary (more planning required)"
                   : "Final summary",
+              });
+            }
+            break;
+          case "verifier":
+            if (typeof data.task_complete === "boolean") {
+              setStatus(
+                data.task_complete
+                  ? "Verifier: task complete"
+                  : "Verifier: more work required"
+              );
+            }
+            if (data && data.reason) {
+              appendMessage("assistant", data.reason, {
+                isMarkdown: true,
+                meta: data.task_complete
+                  ? "Verifier decision · complete"
+                  : "Verifier decision · needs more work",
               });
             }
             break;
