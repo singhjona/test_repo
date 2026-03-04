@@ -8,7 +8,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 import requests
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 try:
     # These imports are expected to exist in the real server package.
@@ -161,13 +161,11 @@ def _oss_call_json(
     logger.debug(
         "Calling OSS with structured output (streaming) for %s", response_model.__name__
     )
-    # Stream and accumulate delta.content fragments into a single string.
-    # If the first attempt returns empty content, retry once before failing.
-    content_buffer = ""
-    max_attempts = 2
-    attempt = 0
-    while attempt < max_attempts and not content_buffer:
-        attempt += 1
+    max_attempts = 5
+    content: Any | None = None
+    for attempt in range(1, max_attempts + 1):
+        # Stream and accumulate delta.content fragments into a single string.
+        content_buffer = ""
         try:
             resp = requests.post(
                 _oss_base_url(),
@@ -237,31 +235,63 @@ def _oss_call_json(
                 max_attempts,
             )
 
-    if not content_buffer:
-        logger.error("OSS streaming returned no content for %s", response_model.__name__)
-        raise HTTPException(
-            status_code=502,
-            detail="Model did not return any streamed content.",
-        )
+        if not content_buffer:
+            logger.error(
+                "OSS streaming returned no content for %s on attempt %d/%d",
+                response_model.__name__,
+                attempt,
+                max_attempts,
+            )
+            if attempt == max_attempts:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Model did not return any streamed content.",
+                )
+            continue
 
-    # For structured output, the model is expected to stream a JSON string.
-    try:
-        content = json.loads(content_buffer)
-    except json.JSONDecodeError as exc:
-        logger.exception("Failed to parse streamed content as JSON: %s", exc)
-        raise HTTPException(
-            status_code=502,
-            detail="Model did not return valid structured JSON.",
-        ) from exc
+        # For structured output, the model is expected to stream a JSON string.
+        try:
+            content = json.loads(content_buffer)
+        except json.JSONDecodeError as exc:
+            logger.exception(
+                "Failed to parse streamed content as JSON for %s on attempt %d/%d: %s",
+                response_model.__name__,
+                attempt,
+                max_attempts,
+                exc,
+            )
+            if attempt == max_attempts:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Model did not return valid structured JSON.",
+                ) from exc
+            # Retry on JSON parse errors.
+            continue
 
-    try:
-        return response_model.model_validate(content)
-    except Exception as exc:
-        logger.exception("Failed to validate structured output: %s", exc)
-        raise HTTPException(
-            status_code=502,
-            detail="Model output did not match expected schema.",
-        ) from exc
+        # Validate against the structured output schema.
+        try:
+            return response_model.model_validate(content)
+        except ValidationError as exc:
+            logger.exception(
+                "Failed to validate structured output for %s on attempt %d/%d: %s",
+                response_model.__name__,
+                attempt,
+                max_attempts,
+                exc,
+            )
+            if attempt == max_attempts:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Model output did not match expected schema.",
+                ) from exc
+            # Retry on validation errors too, since they typically stem from malformed JSON fields.
+            continue
+
+    # This line should be unreachable, but keeps type-checkers happy.
+    raise HTTPException(
+        status_code=502,
+        detail="Model did not return usable structured output.",
+    )
 
 
 def _oss_stream_text(
@@ -761,7 +791,8 @@ async def _planner_phase(
         f"{tools_description}\n\n"
         "IMPORTANT:\n"
         "- You are only PLANNING; you MUST NOT invent tool results.\n"
-        "- Return ONLY valid JSON matching the PlannerOutput schema. Do not include prose outside JSON."
+        "- Return ONLY valid JSON matching the PlannerOutput schema. Do not include prose outside JSON.\n"
+        "- If you output anything that is not valid JSON for this schema, you have FAILED the task."
     )
 
     messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
@@ -815,7 +846,11 @@ async def _agent_loop(
             "Return JSON matching AgentStepOutput: selected_tool (or null), tool_input (or null), "
             "step_explanation, optional new_todos, status_updates, and optional removed_todo_ids "
             "for todos that are no longer needed because requirements changed. "
-            "TOOLS metadata is provided in the system message; only use listed tools."
+            "TOOLS metadata is provided in the system message; only use listed tools.\n\n"
+            "CRITICAL:\n"
+            "- You MUST return ONLY valid JSON matching the AgentStepOutput schema.\n"
+            "- Do not include any explanation outside the JSON.\n"
+            "- If you output anything that is not valid JSON for this schema, you have FAILED the task."
         )
         tools_description = json.dumps(AVAILABLE_TOOLS)
 
@@ -896,7 +931,11 @@ async def _summarizer_phase(
         "- summary: concise natural-language summary of what has been done so far.\n"
         "- details: optional extra detail.\n"
         "- needs_more_planning: true if more work/todos are needed and the workflow should go back to the planner; "
-        "false if the task is complete and the summary can be shown as final."
+        "false if the task is complete and the summary can be shown as final.\n\n"
+        "CRITICAL:\n"
+        "- You MUST return ONLY valid JSON matching the SummarizerOutput schema.\n"
+        "- Do not include any explanation outside the JSON.\n"
+        "- If you output anything that is not valid JSON for this schema, you have FAILED the task."
     )
     messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     messages.extend(session["messages"])
