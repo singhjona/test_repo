@@ -770,6 +770,7 @@ def _append_message(
 async def _planner_phase(
     session_id: str,
     user_message: str,
+    send_event,
 ) -> PlannerOutput:
     session = _get_session(session_id)
     # Make the planner explicitly aware of available tools so it can
@@ -799,7 +800,19 @@ async def _planner_phase(
     messages.extend(session["messages"])
     messages.append({"role": "user", "content": user_message})
 
-    output = _oss_call_json(messages, PlannerOutput)
+    loop = asyncio.get_running_loop()
+    await send_event(
+        "phase",
+        {"phase": "planner", "status": "started"},
+    )
+    output = await loop.run_in_executor(
+        None,
+        lambda: _oss_call_json(messages, PlannerOutput),
+    )
+    await send_event(
+        "phase",
+        {"phase": "planner", "status": "completed"},
+    )
     session["todos"] = [todo.model_dump() for todo in output.todos]
     _append_message(session, "assistant", f"Planner TODOS: {json.dumps(session['todos'])}")
     return output
@@ -868,7 +881,29 @@ async def _agent_loop(
             }
         )
 
-        step_output = _oss_call_json(messages, AgentStepOutput)
+        loop = asyncio.get_running_loop()
+        await send_event(
+            "phase",
+            {
+                "phase": "agent_step",
+                "status": "started",
+                "iteration": iteration,
+                "current_todo_id": current.get("id"),
+            },
+        )
+        step_output = await loop.run_in_executor(
+            None,
+            lambda: _oss_call_json(messages, AgentStepOutput),
+        )
+        await send_event(
+            "phase",
+            {
+                "phase": "agent_step",
+                "status": "completed",
+                "iteration": iteration,
+                "current_todo_id": current.get("id"),
+            },
+        )
 
         if step_output.status_updates:
             for upd in step_output.status_updates:
@@ -943,7 +978,19 @@ async def _summarizer_phase(
         {"role": "user", "content": f"Summarize the work performed for: {user_message}"},
     )
 
-    summary = _oss_call_json(messages, SummarizerOutput)
+    loop = asyncio.get_running_loop()
+    await send_event(
+        "phase",
+        {"phase": "summarizer", "status": "started"},
+    )
+    summary = await loop.run_in_executor(
+        None,
+        lambda: _oss_call_json(messages, SummarizerOutput),
+    )
+    await send_event(
+        "phase",
+        {"phase": "summarizer", "status": "completed"},
+    )
     _append_message(session, "assistant", f"Summary: {summary.summary}")
     await send_event(
         "summary",
@@ -1033,7 +1080,7 @@ async def _agent_session_stream(request: ChatRequest) -> AsyncGenerator[bytes, N
             await _stream_model_reasoning(session_id, request.message, send_event)
             max_cycles = 4
             for cycle in range(max_cycles):
-                planner_output = await _planner_phase(session_id, request.message)
+                planner_output = await _planner_phase(session_id, request.message, send_event)
                 await send_event(
                     "planner_reasoning",
                     {

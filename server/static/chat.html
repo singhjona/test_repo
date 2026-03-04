@@ -1201,6 +1201,11 @@
               }`
             );
             break;
+          case "phase":
+            if (data && data.phase && data.status) {
+              setStatus(`${data.phase} · ${data.status}`);
+            }
+            break;
           case "end":
             setStatus("Finished");
             break;
