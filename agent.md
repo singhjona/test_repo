@@ -934,4 +934,3 @@ async def _agent_session_stream(request: ChatRequest) -> AsyncGenerator[bytes, N
 async def chat_stream(request: ChatRequest) -> StreamingResponse:
     generator = _agent_session_stream(request)
     return StreamingResponse(generator, media_type="text/event-stream")
-

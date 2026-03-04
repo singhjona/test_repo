@@ -945,10 +945,20 @@
 
           const payload = document.createElement("div");
           payload.className = "tool-payload";
+          // For results, prefer showing only the 'result' or 'error' field
+          let toShow = ev.payload;
+          if (ev.type === "result" && ev && typeof ev.payload === "object") {
+            if (Object.prototype.hasOwnProperty.call(ev.payload, "result")) {
+              toShow = ev.payload.result;
+            } else if (Object.prototype.hasOwnProperty.call(ev.payload, "error")) {
+              toShow = ev.payload.error;
+            }
+          }
           try {
-            payload.textContent = JSON.stringify(ev.payload, null, 2);
+            payload.textContent =
+              typeof toShow === "string" ? toShow : JSON.stringify(toShow, null, 2);
           } catch {
-            payload.textContent = String(ev.payload);
+            payload.textContent = String(toShow);
           }
           entry.appendChild(payload);
 
