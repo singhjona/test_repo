@@ -161,68 +161,81 @@ def _oss_call_json(
     logger.debug(
         "Calling OSS with structured output (streaming) for %s", response_model.__name__
     )
-    try:
-        resp = requests.post(
-            _oss_base_url(),
-            json=payload,
-            headers=_oss_headers(),
-            timeout=_oss_timeout(),
-            verify=False,
-            stream=True,
-        )
-    except Exception as exc:  # pragma: no cover - network failure
-        logger.exception("OSS call failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Upstream model call failed.") from exc
-
-    if resp.status_code != 200:
-        try:
-            from json import dumps as _dumps
-
-            payload_str = _dumps(payload, indent=2, default=str)
-        except Exception:  # pragma: no cover - logging best-effort
-            payload_str = "<unserializable payload>"
-        logger.error(
-            "OSS returned non-200: %s %s\nPayload: %s",
-            resp.status_code,
-            resp.text,
-            payload_str,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Upstream model error: {resp.status_code}",
-        )
-
     # Stream and accumulate delta.content fragments into a single string.
+    # If the first attempt returns empty content, retry once before failing.
     content_buffer = ""
-    try:
-        for line in resp.iter_lines():
-            if not line:
-                continue
+    max_attempts = 2
+    attempt = 0
+    while attempt < max_attempts and not content_buffer:
+        attempt += 1
+        try:
+            resp = requests.post(
+                _oss_base_url(),
+                json=payload,
+                headers=_oss_headers(),
+                timeout=_oss_timeout(),
+                verify=False,
+                stream=True,
+            )
+        except Exception as exc:  # pragma: no cover - network failure
+            logger.exception("OSS call failed: %s", exc)
+            raise HTTPException(status_code=502, detail="Upstream model call failed.") from exc
+
+        if resp.status_code != 200:
             try:
-                decoded = line.decode("utf-8").strip()
-            except Exception:
-                continue
-            if not decoded:
-                continue
-            # Support both raw JSON lines and SSE-style "data: {...}" lines
-            if decoded.startswith("data:"):
-                decoded = decoded[5:].strip()
-            if decoded == "[DONE]":
-                break
-            try:
-                chunk = json.loads(decoded)
-            except Exception:
-                # Not a valid JSON chunk; skip
-                continue
-            choices = chunk.get("choices") or []
-            if not choices:
-                continue
-            delta = choices[0].get("delta") or {}
-            piece = delta.get("content")
-            if isinstance(piece, str):
-                content_buffer += piece
-    finally:
-        resp.close()
+                from json import dumps as _dumps
+
+                payload_str = _dumps(payload, indent=2, default=str)
+            except Exception:  # pragma: no cover - logging best-effort
+                payload_str = "<unserializable payload>"
+            logger.error(
+                "OSS returned non-200: %s %s\nPayload: %s",
+                resp.status_code,
+                resp.text,
+                payload_str,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream model error: {resp.status_code}",
+            )
+
+        try:
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    decoded = line.decode("utf-8").strip()
+                except Exception:
+                    continue
+                if not decoded:
+                    continue
+                # Support both raw JSON lines and SSE-style "data: {...}" lines
+                if decoded.startswith("data:"):
+                    decoded = decoded[5:].strip()
+                if decoded == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(decoded)
+                except Exception:
+                    # Not a valid JSON chunk; skip
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
+                if isinstance(piece, str):
+                    content_buffer += piece
+        finally:
+            resp.close()
+
+        if not content_buffer and attempt < max_attempts:
+            logger.warning(
+                "OSS streaming returned empty content for %s; retrying (%d/%d)",
+                response_model.__name__,
+                attempt,
+                max_attempts,
+            )
 
     if not content_buffer:
         logger.error("OSS streaming returned no content for %s", response_model.__name__)
@@ -908,21 +921,37 @@ async def _stream_model_reasoning(
         lambda: _oss_stream_text(messages),
     )
 
-    def iterate_chunks():
-        try:
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                try:
-                    decoded = line.decode("utf-8")
-                except Exception:
-                    continue
-                yield decoded
-        finally:
-            resp.close()
-
-    for chunk in iterate_chunks():
-        await send_event("model_stream", {"delta": chunk})
+    try:
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                decoded = line.decode("utf-8").strip()
+            except Exception:
+                continue
+            if not decoded:
+                continue
+            # Handle SSE-style prefix
+            if decoded.startswith("data:"):
+                decoded = decoded[5:].strip()
+            if decoded == "[DONE]":
+                break
+            try:
+                chunk = json.loads(decoded)
+            except Exception:
+                # If the gateway sends plain text instead of JSON, pass it through.
+                await send_event("model_stream", {"delta": decoded})
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            piece = delta.get("content")
+            if isinstance(piece, str):
+                # Push small deltas immediately so the UI updates in near real-time.
+                await send_event("model_stream", {"delta": piece})
+    finally:
+        resp.close()
 
 
 async def _agent_session_stream(request: ChatRequest) -> AsyncGenerator[bytes, None]:
